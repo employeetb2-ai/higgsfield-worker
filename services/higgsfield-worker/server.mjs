@@ -255,6 +255,54 @@ async function generate(body) {
   }
 }
 
+async function deliverCallback(callbackUrl, payload) {
+  let lastError;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      const response = await fetch(callbackUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-higgsfield-worker-secret": WORKER_SECRET,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) return;
+      const detail = (await response.text()).slice(0, 1000);
+      throw new Error(`Callback failed (${response.status}): ${detail}`);
+    } catch (error) {
+      lastError = error;
+      if (attempt < 5) await new Promise((resolve) => setTimeout(resolve, attempt * 5000));
+    }
+  }
+  throw lastError;
+}
+
+async function runAsyncGeneration(body) {
+  try {
+    await configureAccountContext();
+    const result = await generate(body);
+    await deliverCallback(body.callback_url, {
+      status: "completed",
+      video_url: result.video_url,
+      context: body.callback_context,
+    });
+  } catch (error) {
+    console.error("[higgsfield-worker] async generation failed:", error);
+    try {
+      await deliverCallback(body.callback_url, {
+        status: "failed",
+        error: error instanceof Error ? error.message : "Higgsfield generation failed",
+        context: body.callback_context,
+      });
+    } catch (callbackError) {
+      console.error("[higgsfield-worker] failure callback could not be delivered:", callbackError);
+    }
+  } finally {
+    activeJob = false;
+  }
+}
+
 const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/health") {
     return sendJson(response, 200, {
@@ -265,16 +313,46 @@ const server = createServer(async (request, response) => {
     });
   }
 
-  if (request.method !== "POST" || request.url !== "/generate") {
+  const isSynchronous = request.method === "POST" && request.url === "/generate";
+  const isAsynchronous = request.method === "POST" && request.url === "/generate-async";
+  if (!isSynchronous && !isAsynchronous) {
     return sendJson(response, 404, { error: "Not found" });
   }
   if (!isAuthorized(request)) return sendJson(response, 401, { error: "Unauthorized" });
   if (activeJob)
     return sendJson(response, 429, { error: "A Higgsfield generation is already running" });
 
+  let body;
+  try {
+    body = await readJson(request);
+  } catch (error) {
+    return sendJson(response, 400, {
+      error: error instanceof Error ? error.message : "Invalid request body",
+    });
+  }
+
+  if (isAsynchronous) {
+    try {
+      const callbackUrl = new URL(body.callback_url);
+      if (!["http:", "https:"].includes(callbackUrl.protocol)) {
+        throw new Error("callback_url must be HTTP(S)");
+      }
+      if (!body.callback_context || typeof body.callback_context !== "object") {
+        throw new Error("callback_context is required");
+      }
+    } catch (error) {
+      return sendJson(response, 400, {
+        error: error instanceof Error ? error.message : "Invalid callback",
+      });
+    }
+    activeJob = true;
+    sendJson(response, 202, { status: "accepted", job_id: randomUUID() });
+    void runAsyncGeneration(body);
+    return;
+  }
+
   activeJob = true;
   try {
-    const body = await readJson(request);
     await configureAccountContext();
     const result = await generate(body);
     return sendJson(response, 200, result);
