@@ -16,7 +16,38 @@ const ASPECT_RATIO = process.env.HIGGSFIELD_ASPECT_RATIO ?? "9:16";
 const DURATION = Number(process.env.HIGGSFIELD_DURATION ?? 10);
 const SOUND = process.env.HIGGSFIELD_SOUND === "off" ? "off" : "on";
 const WAIT_TIMEOUT = process.env.HIGGSFIELD_WAIT_TIMEOUT ?? "15m";
+// Fallback image generation (see /generate-image below) — used when the
+// main app's direct Gemini call is blocked by Gemini's own IMAGE_SAFETY
+// filter on certain reference photos (commonly swimwear/lingerie product
+// ads). seedream_v4_5 was chosen after live-testing every image model this
+// Higgsfield account has against the exact photo Gemini blocked — it was
+// one of the few models that (a) actually grounds on the reference image
+// instead of ignoring it and (b) wasn't itself blocked. Images finish in
+// well under a minute, so this is a short, synchronous default — nowhere
+// near video's 15m default.
+const IMAGE_MODEL = process.env.HIGGSFIELD_IMAGE_MODEL ?? "seedream_v4_5";
+const IMAGE_ASPECT_RATIO = process.env.HIGGSFIELD_IMAGE_ASPECT_RATIO ?? "9:16";
+const IMAGE_WAIT_TIMEOUT = process.env.HIGGSFIELD_IMAGE_WAIT_TIMEOUT ?? "3m";
+// Only models actually verified (2026-08-27) to ground on the reference
+// image rather than ignore it, and to not themselves get blocked on the
+// same test photo. Keeps a client-supplied `model` from silently routing to
+// something untested — see services/higgsfield-worker/README.md.
+const ALLOWED_IMAGE_MODELS = new Set([
+  "seedream_v4_5",
+  "seedream_v5_lite",
+  "nano_banana_2_lite",
+  "nano_banana_flash",
+  "nano_banana_pro",
+]);
 const COMMAND_TIMEOUT_MS = Number(process.env.HIGGSFIELD_COMMAND_TIMEOUT_MS ?? 20 * 60 * 1000);
+const configuredRetryAttempts = Number(process.env.HIGGSFIELD_API_RETRY_ATTEMPTS ?? 3);
+const configuredRetryDelay = Number(process.env.HIGGSFIELD_API_RETRY_BASE_DELAY_MS ?? 2000);
+const API_RETRY_ATTEMPTS = Number.isFinite(configuredRetryAttempts)
+  ? Math.max(1, Math.floor(configuredRetryAttempts))
+  : 3;
+const API_RETRY_BASE_DELAY_MS = Number.isFinite(configuredRetryDelay)
+  ? Math.max(0, configuredRetryDelay)
+  : 2000;
 const MAX_BODY_BYTES = 64 * 1024;
 
 if (!WORKER_SECRET) {
@@ -25,6 +56,20 @@ if (!WORKER_SECRET) {
 }
 
 let activeJob = false;
+// Image fallback gets its OWN concurrency tracking, separate from activeJob
+// above. activeJob exists to serialize VIDEO jobs (long-running, CLI-session-
+// heavy) — but the fallback is called from generateStaticAds/
+// generateCarouselFrames, which fire 3 and 5 Gemini calls CONCURRENTLY via
+// Promise.allSettled (up to 8 at once when both run together, as
+// iterations/pipeline.ts does). Sharing the single activeJob lock meant
+// only the first of several simultaneously-IMAGE_SAFETY-blocked poses could
+// ever fall back successfully — every other concurrent attempt got bounced
+// with 429 and had no retry, silently capping a would-be 8/8 recovery down
+// to 1/8. Each image job is a short, independent CLI invocation (no shared
+// session state to protect), so they're safe to run in parallel — just
+// capped to bound worst-case resource use, not to serialize them.
+let activeImageJobs = 0;
+const MAX_CONCURRENT_IMAGE_JOBS = Number(process.env.HIGGSFIELD_MAX_CONCURRENT_IMAGE_JOBS ?? 10);
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -98,6 +143,31 @@ function runCli(args, timeoutMs = COMMAND_TIMEOUT_MS) {
   });
 }
 
+function isRetryableApiFailure(error) {
+  return (
+    error instanceof Error &&
+    /API request failed|fetch failed|ECONNRESET|ETIMEDOUT/i.test(error.message)
+  );
+}
+
+async function runCliWithApiRetry(args) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await runCli(args);
+    } catch (error) {
+      const canRetry = attempt < API_RETRY_ATTEMPTS && isRetryableApiFailure(error);
+      if (!canRetry) throw error;
+
+      const delayMs = API_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      console.warn(
+        `[higgsfield-worker] transient CLI/API failure; retrying in ${delayMs}ms ` +
+          `(attempt ${attempt + 1}/${API_RETRY_ATTEMPTS})`,
+        error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
 async function configureAccountContext() {
   if (WORKSPACE_ID) {
     await runCli(["workspace", "set", WORKSPACE_ID], 30_000);
@@ -243,13 +313,57 @@ async function generate(body) {
       "--json",
       "--no-color",
     ];
-    const { stdout } = await runCli(args);
+    const { stdout } = await runCliWithApiRetry(args);
     const result = parseCliJson(stdout);
     const resultUrl = findResultUrl(result);
     if (!resultUrl) {
       throw new Error("Higgsfield returned no result URL");
     }
     return { video_url: resultUrl, job_id: findJobId(result), status: "completed" };
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function generateImage(body) {
+  if (typeof body.prompt !== "string" || !body.prompt.trim()) {
+    throw new Error("prompt is required");
+  }
+
+  const model = typeof body.model === "string" && body.model ? body.model : IMAGE_MODEL;
+  const aspectRatio =
+    typeof body.aspect_ratio === "string" && body.aspect_ratio ? body.aspect_ratio : IMAGE_ASPECT_RATIO;
+
+  if (!ALLOWED_IMAGE_MODELS.has(model)) {
+    throw new Error(`Unsupported Higgsfield image model: ${model}`);
+  }
+
+  const directory = await fs.mkdtemp(join(tmpdir(), "higgsfield-worker-image-"));
+  try {
+    const imagePath = await downloadSourceImage(body, directory);
+    const args = [
+      "generate",
+      "create",
+      model,
+      "--prompt",
+      body.prompt.trim(),
+      "--image",
+      imagePath,
+      "--aspect_ratio",
+      aspectRatio,
+      "--wait",
+      "--wait-timeout",
+      IMAGE_WAIT_TIMEOUT,
+      "--json",
+      "--no-color",
+    ];
+    const { stdout } = await runCliWithApiRetry(args);
+    const result = parseCliJson(stdout);
+    const resultUrl = findResultUrl(result);
+    if (!resultUrl) {
+      throw new Error("Higgsfield returned no result URL");
+    }
+    return { image_url: resultUrl, job_id: findJobId(result), status: "completed" };
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }
@@ -309,18 +423,25 @@ const server = createServer(async (request, response) => {
       ok: true,
       provider: "higgsfield",
       model: MODEL,
+      imageFallbackModel: IMAGE_MODEL,
       workspaceConfiguredByEnv: Boolean(WORKSPACE_ID),
     });
   }
 
   const isSynchronous = request.method === "POST" && request.url === "/generate";
   const isAsynchronous = request.method === "POST" && request.url === "/generate-async";
-  if (!isSynchronous && !isAsynchronous) {
+  const isImage = request.method === "POST" && request.url === "/generate-image";
+  if (!isSynchronous && !isAsynchronous && !isImage) {
     return sendJson(response, 404, { error: "Not found" });
   }
   if (!isAuthorized(request)) return sendJson(response, 401, { error: "Unauthorized" });
-  if (activeJob)
+  // Video keeps its exclusivity check here. Image has its own, separate
+  // capacity check below — see activeImageJobs above for why they can't
+  // share one lock.
+  if (!isImage && activeJob)
     return sendJson(response, 429, { error: "A Higgsfield generation is already running" });
+  if (isImage && activeImageJobs >= MAX_CONCURRENT_IMAGE_JOBS)
+    return sendJson(response, 429, { error: "Too many concurrent Higgsfield image jobs" });
 
   let body;
   try {
@@ -331,10 +452,26 @@ const server = createServer(async (request, response) => {
     });
   }
 
+  if (isImage) {
+    activeImageJobs += 1;
+    try {
+      await configureAccountContext();
+      const result = await generateImage(body);
+      return sendJson(response, 200, result);
+    } catch (error) {
+      console.error("[higgsfield-worker] image fallback generation failed:", error);
+      return sendJson(response, 502, {
+        error: error instanceof Error ? error.message : "Higgsfield image generation failed",
+      });
+    } finally {
+      activeImageJobs -= 1;
+    }
+  }
+
   if (isAsynchronous) {
     try {
       const callbackUrl = new URL(body.callback_url);
-      if (!["http:", "https:"].includes(callbackUrl.protocol)) {
+      if (!['http:', 'https:'].includes(callbackUrl.protocol)) {
         throw new Error("callback_url must be HTTP(S)");
       }
       if (!body.callback_context || typeof body.callback_context !== "object") {

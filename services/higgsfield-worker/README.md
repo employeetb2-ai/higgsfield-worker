@@ -7,7 +7,31 @@ dashboard. The dashboard never receives the Higgsfield session token.
 
 The dashboard does not call Kling directly or require Kling API credentials.
 All video generation uses Kling through this Higgsfield worker. Copy, static ads,
-carousel images, and collage panels continue to use Gemini.
+carousel images, and collage panels continue to use Gemini as the primary
+image generator.
+
+## Image fallback (`/generate-image`)
+
+Gemini's own image models occasionally block a generation with an
+`IMAGE_SAFETY` finishReason on certain reference photos — most commonly
+swimwear/lingerie product ads, even fully modest ones. This isn't
+adjustable via Gemini's `safetySettings` (confirmed by testing — that
+parameter only controls separate text-prompt harm categories, not this
+filter). When that happens, the dashboard falls back once to this worker's
+`/generate-image` endpoint instead of failing the part outright.
+
+The default fallback model is `seedream_v4_5`, chosen by testing every
+image model available on this Higgsfield account against a real reference
+photo Gemini blocked (2026-08-27): `gpt_image_2` and `seedream_v5_pro` were
+*also* blocked (same underlying issue — the photo itself, not a
+Gemini-specific quirk), and the two cheapest Higgsfield-native models
+(`text2image_soul_v2`, `soul_cinematic`) turned out not to ground on the
+reference image at all — they produced unrelated content, cheap for a
+reason. `seedream_v4_5` and `nano_banana_2_lite` were the best mix of
+accuracy-to-reference and cost among the models that actually worked;
+`seedream_v4_5` was picked as the default for slightly sharper output at
+the same price. See `ALLOWED_IMAGE_MODELS` in `server.mjs` if that ever
+needs revisiting — only re-add a model here after testing it the same way.
 
 ## Local setup
 
@@ -50,13 +74,25 @@ HIGGSFIELD_DURATION=10
 HIGGSFIELD_MODE=pro
 HIGGSFIELD_ASPECT_RATIO=9:16
 HIGGSFIELD_SOUND=on
+HIGGSFIELD_API_RETRY_ATTEMPTS=3
+HIGGSFIELD_API_RETRY_BASE_DELAY_MS=2000
 HIGGSFIELD_PROMPT=Use the original product exactly as shown. Create a highly realistic vertical Dutch lifestyle fashion video with a naturally styled Dutch woman, gentle zoom, candid walking and turning, warm daylight, calm advertisement music, and no talking. Do not redesign the product or generate text in the scene.
 ```
 
-The worker endpoint is:
+The worker endpoints are:
 
 - `GET /health`
-- `POST /generate` — protected by `x-higgsfield-worker-secret`
+- `POST /generate` — Kling video, protected by `x-higgsfield-worker-secret`
+- `POST /generate-async` — Kling video with a callback URL, same auth
+- `POST /generate-image` — image fallback for a Gemini `IMAGE_SAFETY` block, same auth. Body: `{ prompt, image_url, model?, aspect_ratio? }`. `model` defaults to `HIGGSFIELD_IMAGE_MODEL` (`seedream_v4_5`) and must be one of `ALLOWED_IMAGE_MODELS` in `server.mjs`. Synchronous — images finish in well under a minute, so there's no async/callback variant.
+
+Image fallback env vars (all optional, sensible defaults above):
+
+```env
+HIGGSFIELD_IMAGE_MODEL=seedream_v4_5
+HIGGSFIELD_IMAGE_ASPECT_RATIO=9:16
+HIGGSFIELD_IMAGE_WAIT_TIMEOUT=3m
+```
 
 The dashboard sends the approved product image URL and prompt to `/generate`.
 The generated result is downloaded and stored in the existing `ad-videos`
@@ -110,6 +146,8 @@ and Kling jobs can run for several minutes.
    HIGGSFIELD_MODE=pro
    HIGGSFIELD_ASPECT_RATIO=9:16
    HIGGSFIELD_SOUND=on
+   HIGGSFIELD_API_RETRY_ATTEMPTS=3
+   HIGGSFIELD_API_RETRY_BASE_DELAY_MS=2000
    HIGGSFIELD_WAIT_TIMEOUT=15m
    HIGGSFIELD_COMMAND_TIMEOUT_MS=1200000
    ```
