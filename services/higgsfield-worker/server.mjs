@@ -55,6 +55,14 @@ if (!WORKER_SECRET) {
   process.exit(1);
 }
 
+// Tracks the CLI's login-session health so /health can surface it without
+// anyone having to go query ad_creatives.video_error in prod. A session
+// expiry (e.g. "Session expired. Hint: Run: hf auth login") makes every
+// subsequent job fail fast with 403 — this makes that state visible instead
+// of silently failing for days.
+const AUTH_FAILURE_PATTERN = /session expired|hf auth login|http 403|unauthorized/i;
+let lastAuthFailure = null;
+
 let activeJob = false;
 // Image fallback gets its OWN concurrency tracking, separate from activeJob
 // above. activeJob exists to serialize VIDEO jobs (long-running, CLI-session-
@@ -135,9 +143,14 @@ function runCli(args, timeoutMs = COMMAND_TIMEOUT_MS) {
       clearTimeout(timer);
       if (code !== 0) {
         const detail = (stderr || stdout).trim().slice(-2000);
+        if (AUTH_FAILURE_PATTERN.test(detail)) {
+          lastAuthFailure = { message: detail, at: new Date().toISOString() };
+        }
         reject(new Error(`Higgsfield CLI failed (${code ?? signal}): ${detail}`));
         return;
       }
+      // A successful CLI call proves the session is valid again.
+      lastAuthFailure = null;
       resolve({ stdout, stderr });
     });
   });
@@ -425,6 +438,8 @@ const server = createServer(async (request, response) => {
       model: MODEL,
       imageFallbackModel: IMAGE_MODEL,
       workspaceConfiguredByEnv: Boolean(WORKSPACE_ID),
+      authOk: !lastAuthFailure,
+      lastAuthFailure,
     });
   }
 
