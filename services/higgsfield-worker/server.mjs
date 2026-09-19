@@ -382,6 +382,47 @@ async function generateImage(body) {
   }
 }
 
+// True outpaint: expand the SAME source image into a taller aspect ratio,
+// filling only the newly exposed top/bottom bands. Unlike generateImage this
+// is NOT generative image-to-image — it takes NO prompt and runs the CLI's
+// dedicated `create outpaint` job, which keeps the original and extends it.
+// The `outpaint` job name is deliberately outside ALLOWED_IMAGE_MODELS (that
+// allowlist gates the reference-grounded i2i models); outpaint is its own job.
+async function outpaint(body) {
+  const aspectRatio =
+    typeof body.aspect_ratio === "string" && body.aspect_ratio
+      ? body.aspect_ratio
+      : IMAGE_ASPECT_RATIO;
+
+  const directory = await fs.mkdtemp(join(tmpdir(), "higgsfield-worker-outpaint-"));
+  try {
+    const imagePath = await downloadSourceImage(body, directory);
+    const args = [
+      "generate",
+      "create",
+      "outpaint",
+      "--image",
+      imagePath,
+      "--aspect_ratio",
+      aspectRatio,
+      "--wait",
+      "--wait-timeout",
+      IMAGE_WAIT_TIMEOUT,
+      "--json",
+      "--no-color",
+    ];
+    const { stdout } = await runCliWithApiRetry(args);
+    const result = parseCliJson(stdout);
+    const resultUrl = findResultUrl(result);
+    if (!resultUrl) {
+      throw new Error("Higgsfield returned no result URL");
+    }
+    return { image_url: resultUrl, job_id: findJobId(result), status: "completed" };
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function deliverCallback(callbackUrl, payload) {
   let lastError;
   for (let attempt = 1; attempt <= 5; attempt += 1) {
@@ -446,16 +487,18 @@ const server = createServer(async (request, response) => {
   const isSynchronous = request.method === "POST" && request.url === "/generate";
   const isAsynchronous = request.method === "POST" && request.url === "/generate-async";
   const isImage = request.method === "POST" && request.url === "/generate-image";
-  if (!isSynchronous && !isAsynchronous && !isImage) {
+  const isOutpaint = request.method === "POST" && request.url === "/outpaint";
+  if (!isSynchronous && !isAsynchronous && !isImage && !isOutpaint) {
     return sendJson(response, 404, { error: "Not found" });
   }
   if (!isAuthorized(request)) return sendJson(response, 401, { error: "Unauthorized" });
-  // Video keeps its exclusivity check here. Image has its own, separate
-  // capacity check below — see activeImageJobs above for why they can't
-  // share one lock.
-  if (!isImage && activeJob)
+  // Video keeps its exclusivity check here. Image and outpaint share the
+  // separate image-capacity check below — see activeImageJobs above for why
+  // they can't share the video lock.
+  const isImageLike = isImage || isOutpaint;
+  if (!isImageLike && activeJob)
     return sendJson(response, 429, { error: "A Higgsfield generation is already running" });
-  if (isImage && activeImageJobs >= MAX_CONCURRENT_IMAGE_JOBS)
+  if (isImageLike && activeImageJobs >= MAX_CONCURRENT_IMAGE_JOBS)
     return sendJson(response, 429, { error: "Too many concurrent Higgsfield image jobs" });
 
   let body;
@@ -467,14 +510,17 @@ const server = createServer(async (request, response) => {
     });
   }
 
-  if (isImage) {
+  if (isImageLike) {
     activeImageJobs += 1;
     try {
       await configureAccountContext();
-      const result = await generateImage(body);
+      const result = isOutpaint ? await outpaint(body) : await generateImage(body);
       return sendJson(response, 200, result);
     } catch (error) {
-      console.error("[higgsfield-worker] image fallback generation failed:", error);
+      console.error(
+        `[higgsfield-worker] ${isOutpaint ? "outpaint" : "image fallback"} generation failed:`,
+        error,
+      );
       return sendJson(response, 502, {
         error: error instanceof Error ? error.message : "Higgsfield image generation failed",
       });
